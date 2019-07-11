@@ -18,19 +18,26 @@ import org.roda.core.RodaCoreFactory;
 import org.roda.core.data.common.RodaConstants;
 import org.roda.core.data.exceptions.InvalidParameterException;
 import org.roda.core.data.v2.ip.TransferredResource;
+import org.roda.core.data.v2.jobs.Job;
+import org.roda.core.data.v2.jobs.JobStats;
 import org.roda.core.data.v2.jobs.PluginParameter;
 import org.roda.core.data.v2.jobs.PluginParameter.PluginParameterType;
+import org.roda.core.index.IndexService;
+import org.roda.core.model.ModelService;
 import org.roda.core.plugins.Plugin;
 import org.roda.core.plugins.PluginManager;
+import org.roda.core.plugins.plugins.PluginHelper;
 import org.roda.core.plugins.plugins.antivirus.AntivirusPlugin;
 import org.roda.core.plugins.plugins.base.DescriptiveMetadataValidationPlugin;
 import org.roda.core.plugins.plugins.characterization.PremisSkeletonPlugin;
 import org.roda.core.plugins.plugins.characterization.SiegfriedPlugin;
+import org.roda.core.plugins.plugins.ingest.notifications.EmailIngestNotification;
+import org.roda.core.plugins.plugins.ingest.notifications.HttpIngestNotification;
+import org.roda.core.plugins.plugins.ingest.notifications.IngestNotification;
 import org.roda.core.plugins.plugins.ingest.steps.AutoAcceptIngestStep;
 import org.roda.core.plugins.plugins.ingest.steps.IngestStep;
 
 public class ConfigurableIngestPlugin extends DefaultIngestPlugin {
-
   private Map<String, PluginParameter> pluginParameters = new HashMap<>();
   private List<String> deactivatedPlugins = new ArrayList<>();
 
@@ -67,8 +74,7 @@ public class ConfigurableIngestPlugin extends DefaultIngestPlugin {
     }
 
     if (!deactivatedPlugins.contains(DefaultIngestPlugin.PLUGIN_CLASS_TIKA_FULLTEXT)) {
-      pluginParameters.add(getPluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_EXTRACTION));
-      pluginParameters.add(getPluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION));
+      pluginParameters.add(getPluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION));
     }
 
     if (!deactivatedPlugins.contains(DefaultIngestPlugin.PLUGIN_CLASS_DIGITAL_SIGNATURE)) {
@@ -135,13 +141,10 @@ public class ConfigurableIngestPlugin extends DefaultIngestPlugin {
 
       plugin = pluginManager.getPlugin(DefaultIngestPlugin.PLUGIN_CLASS_TIKA_FULLTEXT);
       if (plugin != null) {
-        pluginParameters.put(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_EXTRACTION,
-          new PluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_EXTRACTION, "Feature extraction",
-            PluginParameterType.BOOLEAN, "false", true, false, "Extraction of technical metadata using Apache Tika"));
-
-        pluginParameters.put(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION,
-          new PluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION, "Full-text extraction",
-            PluginParameterType.BOOLEAN, "false", true, false, "Extraction of full-text using Apache Tika"));
+        pluginParameters.put(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION,
+          new PluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION,
+            "Feature & full-text extraction", PluginParameterType.BOOLEAN, "false", true, false,
+            "Extraction of technical metadata and full-text using Apache Tika"));
       } else {
         deactivatedPlugins.add(DefaultIngestPlugin.PLUGIN_CLASS_TIKA_FULLTEXT);
       }
@@ -224,9 +227,12 @@ public class ConfigurableIngestPlugin extends DefaultIngestPlugin {
     params.put("profile", "1b");
     steps.add(new IngestStep(DefaultIngestPlugin.PLUGIN_CLASS_VERAPDF,
       DefaultIngestPlugin.PLUGIN_PARAMS_DO_VERAPDF_CHECK, false, false, true, false, params));
-    // 7.1) feature extraction (using Apache Tika)
-    // 7.2) full-text extraction (using Apache Tika)
-
+    // 7) feature & full-text extraction (using Apache Tika)
+    params = new HashMap<>();
+    params.put(RodaConstants.PLUGIN_PARAMS_DO_FEATURE_EXTRACTION, "true");
+    params.put(RodaConstants.PLUGIN_PARAMS_DO_FULLTEXT_EXTRACTION, "true");
+    steps.add(new IngestStep(DefaultIngestPlugin.PLUGIN_CLASS_TIKA_FULLTEXT,
+      DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION, false, false, true, false, params));
     // 8) validation of digital signature
     steps.add(new IngestStep(DefaultIngestPlugin.PLUGIN_CLASS_DIGITAL_SIGNATURE,
       DefaultIngestPlugin.PLUGIN_PARAMS_DO_DIGITAL_SIGNATURE_VALIDATION, false, false, true, false));
@@ -237,6 +243,16 @@ public class ConfigurableIngestPlugin extends DefaultIngestPlugin {
     steps.add(new AutoAcceptIngestStep(AutoAcceptSIPPlugin.class.getName(), RodaConstants.PLUGIN_PARAMS_DO_AUTO_ACCEPT,
       true, true, true, true));
     return steps;
+  }
+
+  @Override
+  public List<IngestNotification> getNotifications() {
+    List<IngestNotification> notifications = new ArrayList<>();
+    notifications.add(new EmailIngestNotification(
+      PluginHelper.getStringFromParameters(this, getPluginParameter(RodaConstants.PLUGIN_PARAMS_EMAIL_NOTIFICATION))));
+    notifications.add(new HttpIngestNotification(
+      PluginHelper.getStringFromParameters(this, getPluginParameter(RodaConstants.NOTIFICATION_HTTP_ENDPOINT))));
+    return notifications;
   }
 
   @Override

@@ -21,15 +21,16 @@ import org.roda.core.data.v2.ip.TransferredResource;
 import org.roda.core.data.v2.jobs.PluginParameter;
 import org.roda.core.data.v2.jobs.PluginParameter.PluginParameterType;
 import org.roda.core.plugins.Plugin;
-import org.roda.core.plugins.plugins.antivirus.AntivirusPlugin;
+import org.roda.core.plugins.plugins.PluginHelper;
 import org.roda.core.plugins.plugins.base.DescriptiveMetadataValidationPlugin;
 import org.roda.core.plugins.plugins.characterization.PremisSkeletonPlugin;
-import org.roda.core.plugins.plugins.characterization.SiegfriedPlugin;
+import org.roda.core.plugins.plugins.ingest.notifications.EmailIngestNotification;
+import org.roda.core.plugins.plugins.ingest.notifications.HttpIngestNotification;
+import org.roda.core.plugins.plugins.ingest.notifications.IngestNotification;
 import org.roda.core.plugins.plugins.ingest.steps.AutoAcceptIngestStep;
 import org.roda.core.plugins.plugins.ingest.steps.IngestStep;
 
 public class MinimalIngestPlugin extends DefaultIngestPlugin {
-
   public static final int TOTAL_STEPS = 5;
 
   private static Map<String, PluginParameter> pluginParameters = new HashMap<>();
@@ -122,36 +123,29 @@ public class MinimalIngestPlugin extends DefaultIngestPlugin {
   @Override
   public List<IngestStep> getIngestSteps() {
     List<IngestStep> steps = new ArrayList<>();
-    // 2) virus check
-    steps.add(new IngestStep(AntivirusPlugin.class.getName(), RodaConstants.PLUGIN_PARAMS_DO_VIRUS_CHECK, true, false,
-      true, true));
-    // 3) descriptive metadata validation
+    // 2) descriptive metadata validation
     steps.add(new IngestStep(DescriptiveMetadataValidationPlugin.class.getName(),
       RodaConstants.PLUGIN_PARAMS_DO_DESCRIPTIVE_METADATA_VALIDATION, true, true, true, true));
-    // 4) create file fixity information
+    // 3) create file fixity information
     steps.add(new IngestStep(PremisSkeletonPlugin.class.getName(), RodaConstants.PLUGIN_PARAMS_CREATE_PREMIS_SKELETON,
       true, true, true, true));
-    // 5) format identification (using Siegfried)
-    steps.add(new IngestStep(SiegfriedPlugin.class.getName(), RodaConstants.PLUGIN_PARAMS_DO_FILE_FORMAT_IDENTIFICATION,
-      true, false, true, false));
-    // 6) Format validation - PDF/A format validator (using VeraPDF)
-    Map<String, String> params = new HashMap<>();
-    params.put("profile", "1b");
-    steps.add(new IngestStep(DefaultIngestPlugin.PLUGIN_CLASS_VERAPDF,
-      DefaultIngestPlugin.PLUGIN_PARAMS_DO_VERAPDF_CHECK, false, false, true, false, params));
-    // 7.1) feature extraction (using Apache Tika)
-    // 7.2) full-text extraction (using Apache Tika)
-
-    // 8) validation of digital signature
-    steps.add(new IngestStep(DefaultIngestPlugin.PLUGIN_CLASS_DIGITAL_SIGNATURE,
-      DefaultIngestPlugin.PLUGIN_PARAMS_DO_DIGITAL_SIGNATURE_VALIDATION, false, false, true, false));
-    // 9) verify producer authorization
+    // 4) verify producer authorization
     steps.add(new IngestStep(VerifyUserAuthorizationPlugin.class.getName(),
       RodaConstants.PLUGIN_PARAMS_DO_PRODUCER_AUTHORIZATION_CHECK, true, true, true, true));
-    // 10) Auto accept
+    // 5) Auto accept
     steps.add(new AutoAcceptIngestStep(AutoAcceptSIPPlugin.class.getName(), RodaConstants.PLUGIN_PARAMS_DO_AUTO_ACCEPT,
       true, true, true, true));
     return steps;
+  }
+
+  @Override
+  public List<IngestNotification> getNotifications() {
+    List<IngestNotification> notifications = new ArrayList<>();
+    notifications.add(new EmailIngestNotification(
+      PluginHelper.getStringFromParameters(this, getPluginParameter(RodaConstants.PLUGIN_PARAMS_EMAIL_NOTIFICATION))));
+    notifications.add(new HttpIngestNotification(
+      PluginHelper.getStringFromParameters(this, getPluginParameter(RodaConstants.NOTIFICATION_HTTP_ENDPOINT))));
+    return notifications;
   }
 
   @Override

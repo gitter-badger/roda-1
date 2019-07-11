@@ -808,6 +808,7 @@ public final class RodaConstants {
   public static final String PLUGIN_PARAMS_LOCK_REQUEST_UUID = "parameter.lock_request_uuid";
   public static final String PLUGIN_PARAMS_JOB_ID = "job.id";
   public static final String PLUGIN_PARAMS_OTHER_JOB_ID = "other_job.id";
+  public static final String PLUGIN_PARAMS_DO_FEATURE_EXTRACTION = "parameter.do_feature_extraction";
   public static final String PLUGIN_PARAMS_DO_FULLTEXT_EXTRACTION = "parameter.do_fulltext_extraction";
   public static final String PLUGIN_PARAMS_TOTAL_STEPS = "parameter.total_steps";
   public static final String PLUGIN_PARAMS_STRING_VALUE = "parameter.string_value";

@@ -7,14 +7,10 @@
  */
 package org.roda.core.plugins.plugins.ingest;
 
-import java.io.IOException;
-import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -22,8 +18,6 @@ import java.util.Optional;
 
 import org.apache.commons.lang3.StringUtils;
 import org.roda.core.RodaCoreFactory;
-import org.roda.core.common.notifications.EmailNotificationProcessor;
-import org.roda.core.common.notifications.HTTPNotificationProcessor;
 import org.roda.core.data.common.RodaConstants;
 import org.roda.core.data.common.RodaConstants.PreservationEventType;
 import org.roda.core.data.exceptions.AlreadyExistsException;
@@ -34,11 +28,8 @@ import org.roda.core.data.exceptions.JobException;
 import org.roda.core.data.exceptions.NotFoundException;
 import org.roda.core.data.exceptions.RequestNotValidException;
 import org.roda.core.data.v2.LiteOptionalWithCause;
-import org.roda.core.data.v2.index.filter.Filter;
-import org.roda.core.data.v2.index.filter.SimpleFilterParameter;
 import org.roda.core.data.v2.ip.AIP;
 import org.roda.core.data.v2.ip.TransferredResource;
-import org.roda.core.data.v2.jobs.IndexedReport;
 import org.roda.core.data.v2.jobs.Job;
 import org.roda.core.data.v2.jobs.JobStats;
 import org.roda.core.data.v2.jobs.PluginParameter;
@@ -46,10 +37,8 @@ import org.roda.core.data.v2.jobs.PluginParameter.PluginParameterType;
 import org.roda.core.data.v2.jobs.PluginType;
 import org.roda.core.data.v2.jobs.Report;
 import org.roda.core.data.v2.jobs.Report.PluginState;
-import org.roda.core.data.v2.notifications.Notification;
 import org.roda.core.data.v2.validation.ValidationException;
 import org.roda.core.index.IndexService;
-import org.roda.core.index.utils.IterableIndexResult;
 import org.roda.core.model.LiteRODAObjectFactory;
 import org.roda.core.model.ModelService;
 import org.roda.core.plugins.AbstractPlugin;
@@ -59,15 +48,13 @@ import org.roda.core.plugins.RODAObjectsProcessingLogic;
 import org.roda.core.plugins.orchestrate.IngestJobPluginInfo;
 import org.roda.core.plugins.orchestrate.JobPluginInfo;
 import org.roda.core.plugins.plugins.PluginHelper;
+import org.roda.core.plugins.plugins.ingest.notifications.IngestNotification;
 import org.roda.core.plugins.plugins.ingest.steps.IngestExecutePack;
 import org.roda.core.plugins.plugins.ingest.steps.IngestStep;
 import org.roda.core.plugins.plugins.ingest.steps.IngestStepsUtils;
 import org.roda.core.storage.StorageService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.github.jknack.handlebars.Handlebars;
-import com.google.common.base.CaseFormat;
 
 /***
  * https://docs.google.com/spreadsheets/d/
@@ -95,8 +82,7 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
   public static final String PLUGIN_CLASS_TIKA_FULLTEXT = "org.roda.core.plugins.external.TikaFullTextPlugin";
 
   public static final String PLUGIN_PARAMS_DO_VERAPDF_CHECK = "parameter.do_verapdf_check";
-  public static final String PLUGIN_PARAMS_DO_FEATURE_EXTRACTION = "parameter.do_feature_extraction";
-  public static final String PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION = "parameter.do_fulltext_extraction";
+  public static final String PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION = "parameter.do_feature_full_text_extraction";
   public static final String PLUGIN_PARAMS_DO_DIGITAL_SIGNATURE_VALIDATION = "parameter.do_digital_signature_validation";
 
   private String successMessage;
@@ -185,24 +171,6 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
         step.execute(pack);
       }
 
-      // 7.1) feature extraction (using Apache Tika)
-      // 7.2) full-text extraction (using Apache Tika)
-      /*if (!aips.isEmpty() && (PluginHelper.verifyIfStepShouldBePerformed(this,
-        getPluginParameter(PLUGIN_PARAMS_DO_FEATURE_EXTRACTION), PLUGIN_CLASS_TIKA_FULLTEXT)
-        || PluginHelper.verifyIfStepShouldBePerformed(this, getPluginParameter(PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION),
-          PLUGIN_CLASS_TIKA_FULLTEXT))) {
-        Map<String, String> params = new HashMap<>();
-        params.put(PLUGIN_PARAMS_DO_FEATURE_EXTRACTION, PluginHelper.verifyIfStepShouldBePerformed(this,
-          getPluginParameter(PLUGIN_PARAMS_DO_FEATURE_EXTRACTION), PLUGIN_CLASS_TIKA_FULLTEXT) ? "true" : "false");
-        params.put(RodaConstants.PLUGIN_PARAMS_DO_FULLTEXT_EXTRACTION, PluginHelper.verifyIfStepShouldBePerformed(this,
-          getPluginParameter(PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION), PLUGIN_CLASS_TIKA_FULLTEXT) ? "true" : "false");
-        pluginReport = IngestStepsUtils.executeStep(index, model, storage, jobPluginInfo, getParameterValues(),
-          aips, params, PLUGIN_CLASS_TIKA_FULLTEXT);
-        IngestStepsUtils.mergeReports(jobPluginInfo, pluginReport);
-        IngestStepsUtils.recalculateAIPsList(model, index, jobPluginInfo, aips, false);
-        PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
-      }*/
-
       createIngestEndedEvent(model, index, jobPluginInfo, cachedJob);
 
       getAfterExecute().ifPresent(e -> e.execute(jobPluginInfo, aips));
@@ -211,7 +179,7 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
       jobPluginInfo.finalizeInfo();
       PluginHelper.updateJobInformationAsync(this, jobPluginInfo);
     } catch (JobException e) {
-      // throw new PluginException("A job exception has occurred", e);
+      // do nothing
     } finally {
       // remove locks if any
       PluginHelper.releaseObjectLock(this);
@@ -231,7 +199,10 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
       if (whenFailed && jobStats.getSourceObjectsProcessedWithFailure() == 0) {
         // do nothing
       } else {
-        sendNotification(model, index, job, jobStats);
+        List<IngestNotification> notifications = getNotifications();
+        for (IngestNotification notification : notifications) {
+          notification.notificate(model, index, job, jobStats);
+        }
       }
     } catch (GenericException | RequestNotValidException | NotFoundException | AuthorizationDeniedException e) {
       LOGGER.error("Could not send ingest notification", e);
@@ -305,7 +276,6 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
           jobPluginInfo.incrementObjectsProcessedWithFailure();
           jobPluginInfo.failOtherTransferredResourceAIPs(model, index, transferredResourceId);
           transferredResourcesToRemoveFromjobPluginInfo.add(transferredResourceId);
-
           break;
         }
       }
@@ -316,100 +286,13 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
     }
   }
 
-  private void sendNotification(ModelService model, IndexService index, Job job, JobStats jobStats)
-    throws GenericException, RequestNotValidException, NotFoundException, AuthorizationDeniedException {
-    String emails = PluginHelper.getStringFromParameters(this,
-      getPluginParameter(RodaConstants.PLUGIN_PARAMS_EMAIL_NOTIFICATION));
-
-    if (StringUtils.isNotBlank(emails)) {
-      List<String> emailList = new ArrayList<>(Arrays.asList(emails.split("\\s*,\\s*")));
-      Notification notification = new Notification();
-      String outcome = PluginState.SUCCESS.toString();
-
-      if (jobStats.getSourceObjectsProcessedWithFailure() > 0) {
-        outcome = PluginState.FAILURE.toString();
-      }
-
-      String subject = RodaCoreFactory.getRodaConfigurationAsString("core", "notification", "ingest_subject");
-      if (StringUtils.isNotBlank(subject)) {
-        subject = subject.replaceAll("\\{RESULT\\}", outcome);
-      } else {
-        subject = outcome;
-      }
-
-      notification.setSubject(subject);
-      notification.setFromUser(this.getClass().getSimpleName());
-      notification.setRecipientUsers(emailList);
-
-      Map<String, Object> scopes = new HashMap<>();
-      scopes.put("outcome", outcome);
-      scopes.put("type", CaseFormat.UPPER_UNDERSCORE.to(CaseFormat.UPPER_CAMEL, job.getPluginType().toString()));
-      scopes.put("sips", jobStats.getSourceObjectsCount());
-      scopes.put("success", jobStats.getSourceObjectsProcessedWithSuccess());
-      scopes.put("failed", jobStats.getSourceObjectsProcessedWithFailure());
-      scopes.put("name", job.getName());
-      scopes.put("creator", job.getUsername());
-
-      if (outcome.equals(PluginState.FAILURE.toString())) {
-        Filter filter = new Filter();
-        filter.add(new SimpleFilterParameter(RodaConstants.JOB_REPORT_JOB_ID, job.getId()));
-        filter.add(new SimpleFilterParameter(RodaConstants.JOB_REPORT_PLUGIN_STATE, PluginState.FAILURE.toString()));
-        try (IterableIndexResult<IndexedReport> reports = index.findAll(IndexedReport.class, filter,
-          Collections.emptyList())) {
-
-          StringBuilder builder = new StringBuilder();
-
-          for (IndexedReport report : reports) {
-            Report last = report.getReports().get(report.getReports().size() - 1);
-            builder.append(last.getPluginDetails()).append("\n\n");
-          }
-
-          scopes.put("failures", new Handlebars.SafeString(builder.toString()));
-        } catch (IOException e) {
-          LOGGER.error("Error getting failed reports", e);
-        }
-      }
-
-      SimpleDateFormat parser = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-      scopes.put("start", parser.format(job.getStartDate()));
-
-      long duration = (new Date().getTime() - job.getStartDate().getTime()) / 1000;
-      scopes.put("duration", duration + " seconds");
-      model.createNotification(notification,
-        new EmailNotificationProcessor(RodaConstants.INGEST_EMAIL_TEMPLATE, scopes));
-    }
-
-    String httpNotifications = PluginHelper.getStringFromParameters(this,
-      getPluginParameter(RodaConstants.NOTIFICATION_HTTP_ENDPOINT));
-
-    if (StringUtils.isNotBlank(httpNotifications)) {
-      Notification notification = new Notification();
-      String outcome = PluginState.SUCCESS.toString();
-
-      if (jobStats.getSourceObjectsProcessedWithFailure() > 0) {
-        outcome = PluginState.FAILURE.toString();
-      }
-
-      notification.setSubject("RODA ingest process finished - " + outcome);
-      notification.setFromUser(this.getClass().getSimpleName());
-      notification.setRecipientUsers(Collections.singletonList(httpNotifications));
-      Map<String, Object> scope = new HashMap<>();
-      scope.put(HTTPNotificationProcessor.JOB_KEY, job);
-      model.createNotification(notification, new HTTPNotificationProcessor(httpNotifications, scope));
-    }
-  }
-
   private int calculateEffectiveTotalSteps() {
     // 20180716 hsilva: the following list contains ids of the parameters that
-    // are not steps & therefore must be ignored when calculation the amount of
+    // are not steps & therefore must be ignored when calculating the amount of
     // effective steps
     List<String> parameterIdsToIgnore = Arrays.asList(RodaConstants.PLUGIN_PARAMS_FORCE_PARENT_ID,
-      PLUGIN_PARAMS_DO_FEATURE_EXTRACTION, PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION,
       RodaConstants.PLUGIN_PARAMS_NOTIFICATION_WHEN_FAILED);
     int effectiveTotalSteps = getTotalSteps();
-    boolean tikaParameters = false;
-    boolean dontDoFeatureExtraction = false;
-    boolean dontDoFulltext = false;
 
     for (PluginParameter pluginParameter : getParameters()) {
       if (pluginParameter.getType() == PluginParameterType.BOOLEAN
@@ -417,24 +300,8 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
         && !PluginHelper.verifyIfStepShouldBePerformed(this, pluginParameter)) {
         effectiveTotalSteps--;
       }
-
-      if (pluginParameter.getId().equals(PLUGIN_PARAMS_DO_FEATURE_EXTRACTION)) {
-        tikaParameters = true;
-        if (!PluginHelper.verifyIfStepShouldBePerformed(this, pluginParameter)) {
-          dontDoFeatureExtraction = true;
-        }
-      }
-      if (pluginParameter.getId().equals(PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION)) {
-        tikaParameters = true;
-        if (!PluginHelper.verifyIfStepShouldBePerformed(this, pluginParameter)) {
-          dontDoFulltext = true;
-        }
-      }
     }
 
-    if (tikaParameters && (dontDoFeatureExtraction && dontDoFulltext)) {
-      effectiveTotalSteps--;
-    }
     return effectiveTotalSteps;
   }
 
@@ -541,6 +408,8 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
   public abstract void setTotalSteps();
 
   public abstract List<IngestStep> getIngestSteps();
+
+  public abstract List<IngestNotification> getNotifications();
 
   public abstract Optional<? extends AfterExecute> getAfterExecute();
 

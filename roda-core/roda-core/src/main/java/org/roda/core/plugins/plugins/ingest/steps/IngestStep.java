@@ -18,6 +18,10 @@ public class IngestStep implements IngestCommand {
   private Map<String, String> parameters;
   private Function<IngestExecutePack, Void> genericFunction = null;
 
+  public IngestStep(Function<IngestExecutePack, Void> function) {
+    this.genericFunction = function;
+  }
+
   public IngestStep(String pluginName, String parameterName, boolean usesCorePlugin, boolean mandatory,
     boolean needsAips, boolean removesAIPs) {
     this(pluginName, parameterName, usesCorePlugin, mandatory, needsAips, removesAIPs, new HashMap<>());
