@@ -5,7 +5,7 @@
  *
  * https://github.com/keeps/roda
  */
-package org.roda.core.plugins.plugins.ingest;
+package org.roda.core.plugins.plugins.ingest.v2;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -22,12 +22,57 @@ import org.roda.core.data.v2.jobs.PluginParameter;
 import org.roda.core.data.v2.jobs.PluginParameter.PluginParameterType;
 import org.roda.core.plugins.Plugin;
 import org.roda.core.plugins.PluginManager;
+import org.roda.core.plugins.plugins.PluginHelper;
 import org.roda.core.plugins.plugins.antivirus.AntivirusPlugin;
 import org.roda.core.plugins.plugins.base.DescriptiveMetadataValidationPlugin;
 import org.roda.core.plugins.plugins.characterization.PremisSkeletonPlugin;
 import org.roda.core.plugins.plugins.characterization.SiegfriedPlugin;
+import org.roda.core.plugins.plugins.ingest.AutoAcceptSIPPlugin;
+import org.roda.core.plugins.plugins.ingest.EARKSIPToAIPPlugin;
+import org.roda.core.plugins.plugins.ingest.VerifyUserAuthorizationPlugin;
+import org.roda.core.plugins.plugins.ingest.v2.steps.AutoAcceptIngestStep;
+import org.roda.core.plugins.plugins.ingest.v2.steps.IngestStep;
+import org.roda.core.plugins.plugins.notifications.EmailIngestNotification;
+import org.roda.core.plugins.plugins.notifications.HttpGenericNotification;
+import org.roda.core.plugins.plugins.notifications.JobNotification;
 
 public class ConfigurableIngestPlugin extends DefaultIngestPlugin {
+  private static List<IngestStep> steps = new ArrayList<>();
+
+  static {
+    // 2) virus check
+    steps.add(new IngestStep(AntivirusPlugin.class.getName(), RodaConstants.PLUGIN_PARAMS_DO_VIRUS_CHECK, true, false,
+      true, true));
+    // 3) descriptive metadata validation
+    steps.add(new IngestStep(DescriptiveMetadataValidationPlugin.class.getName(),
+      RodaConstants.PLUGIN_PARAMS_DO_DESCRIPTIVE_METADATA_VALIDATION, true, true, true, true));
+    // 4) create file fixity information
+    steps.add(new IngestStep(PremisSkeletonPlugin.class.getName(), RodaConstants.PLUGIN_PARAMS_CREATE_PREMIS_SKELETON,
+      true, true, true, true));
+    // 5) format identification (using Siegfried)
+    steps.add(new IngestStep(SiegfriedPlugin.class.getName(), RodaConstants.PLUGIN_PARAMS_DO_FILE_FORMAT_IDENTIFICATION,
+      true, false, true, false));
+    // 6) Format validation - PDF/A format validator (using VeraPDF)
+    Map<String, String> params = new HashMap<>();
+    params.put("profile", "1b");
+    steps.add(new IngestStep(DefaultIngestPlugin.PLUGIN_CLASS_VERAPDF,
+      DefaultIngestPlugin.PLUGIN_PARAMS_DO_VERAPDF_CHECK, false, false, true, false, params));
+    // 7) feature & full-text extraction (using Apache Tika)
+    params = new HashMap<>();
+    params.put(RodaConstants.PLUGIN_PARAMS_DO_FEATURE_EXTRACTION, "true");
+    params.put(RodaConstants.PLUGIN_PARAMS_DO_FULLTEXT_EXTRACTION, "true");
+    steps.add(new IngestStep(DefaultIngestPlugin.PLUGIN_CLASS_TIKA_FULLTEXT,
+      DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION, false, false, true, false, params));
+    // 8) validation of digital signature
+    steps.add(new IngestStep(DefaultIngestPlugin.PLUGIN_CLASS_DIGITAL_SIGNATURE,
+      DefaultIngestPlugin.PLUGIN_PARAMS_DO_DIGITAL_SIGNATURE_VALIDATION, false, false, true, false));
+    // 9) verify producer authorization
+    steps.add(new IngestStep(VerifyUserAuthorizationPlugin.class.getName(),
+      RodaConstants.PLUGIN_PARAMS_DO_PRODUCER_AUTHORIZATION_CHECK, true, true, true, true));
+    // 10) Auto accept
+    steps.add(new AutoAcceptIngestStep(AutoAcceptSIPPlugin.class.getName(), RodaConstants.PLUGIN_PARAMS_DO_AUTO_ACCEPT,
+      true, true, true, true));
+  }
 
   private Map<String, PluginParameter> pluginParameters = new HashMap<>();
   private List<String> deactivatedPlugins = new ArrayList<>();
@@ -65,8 +110,7 @@ public class ConfigurableIngestPlugin extends DefaultIngestPlugin {
     }
 
     if (!deactivatedPlugins.contains(DefaultIngestPlugin.PLUGIN_CLASS_TIKA_FULLTEXT)) {
-      pluginParameters.add(getPluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_EXTRACTION));
-      pluginParameters.add(getPluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION));
+      pluginParameters.add(getPluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION));
     }
 
     if (!deactivatedPlugins.contains(DefaultIngestPlugin.PLUGIN_CLASS_DIGITAL_SIGNATURE)) {
@@ -133,13 +177,10 @@ public class ConfigurableIngestPlugin extends DefaultIngestPlugin {
 
       plugin = pluginManager.getPlugin(DefaultIngestPlugin.PLUGIN_CLASS_TIKA_FULLTEXT);
       if (plugin != null) {
-        pluginParameters.put(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_EXTRACTION,
-          new PluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_EXTRACTION, "Feature extraction",
-            PluginParameterType.BOOLEAN, "false", true, false, "Extraction of technical metadata using Apache Tika"));
-
-        pluginParameters.put(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION,
-          new PluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION, "Full-text extraction",
-            PluginParameterType.BOOLEAN, "false", true, false, "Extraction of full-text using Apache Tika"));
+        pluginParameters.put(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION,
+          new PluginParameter(DefaultIngestPlugin.PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION,
+            "Feature & full-text extraction", PluginParameterType.BOOLEAN, "false", true, false,
+            "Extraction of technical metadata and full-text using Apache Tika"));
       } else {
         deactivatedPlugins.add(DefaultIngestPlugin.PLUGIN_CLASS_TIKA_FULLTEXT);
       }
@@ -199,7 +240,28 @@ public class ConfigurableIngestPlugin extends DefaultIngestPlugin {
 
   @Override
   public void setTotalSteps() {
-    this.totalSteps = DefaultIngestPlugin.INITIAL_TOTAL_STEPS - deactivatedPlugins.size();
+    this.totalSteps = steps.size() + 1;
+  }
+
+  @Override
+  public List<IngestStep> getIngestSteps() {
+    return steps;
+  }
+
+  @Override
+  public List<JobNotification> getNotifications() {
+    List<JobNotification> notifications = new ArrayList<>();
+
+    boolean whenFailed = PluginHelper.getBooleanFromParameters(this,
+      getPluginParameter(RodaConstants.PLUGIN_PARAMS_NOTIFICATION_WHEN_FAILED));
+
+    notifications.add(new EmailIngestNotification(
+      PluginHelper.getStringFromParameters(this, getPluginParameter(RodaConstants.PLUGIN_PARAMS_EMAIL_NOTIFICATION)),
+      whenFailed));
+    notifications.add(new HttpGenericNotification(
+      PluginHelper.getStringFromParameters(this, getPluginParameter(RodaConstants.NOTIFICATION_HTTP_ENDPOINT)),
+      whenFailed));
+    return notifications;
   }
 
   @Override

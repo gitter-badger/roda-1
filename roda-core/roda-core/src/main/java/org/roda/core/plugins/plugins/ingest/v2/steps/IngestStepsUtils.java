@@ -1,4 +1,4 @@
-package org.roda.core.plugins.plugins.ingest.steps;
+package org.roda.core.plugins.plugins.ingest.v2.steps;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -32,32 +32,32 @@ import org.slf4j.LoggerFactory;
 public class IngestStepsUtils {
   private static final Logger LOGGER = LoggerFactory.getLogger(IngestStepsUtils.class);
 
-  public static void executePlugin(IngestExecutePack pack, IngestStep step) {
-    if (!step.needsAips() || !pack.getAips().isEmpty()) {
-      Report pluginReport = IngestStepsUtils.executeStep(pack, step.getParameters(), step.getPluginName());
-      mergeReports(pack.getJobPluginInfo(), pluginReport);
+  public static void executePlugin(IngestStepBundle bundle, IngestStep step) {
+    if (!step.needsAips() || !bundle.getAips().isEmpty()) {
+      Report pluginReport = IngestStepsUtils.executeStep(bundle, step.getParameters(), step.getPluginName());
+      mergeReports(bundle.getJobPluginInfo(), pluginReport);
       if (step.needsAips()) {
-        recalculateAIPsList(pack, step.removesAips());
+        recalculateAIPsList(bundle, step.removesAips());
       }
     }
   }
 
-  public static Report executeStep(IngestExecutePack pack, Map<String, String> params, String pluginName) {
+  public static Report executeStep(IngestStepBundle bundle, Map<String, String> params, String pluginName) {
     Plugin<AIP> plugin = RodaCoreFactory.getPluginManager().getPlugin(pluginName, AIP.class);
-    Map<String, String> mergedParams = new HashMap<>(pack.getParameterValues());
+    Map<String, String> mergedParams = new HashMap<>(bundle.getParameterValues());
     if (params != null) {
       mergedParams.putAll(params);
     }
 
     // set outcome_object_id > source_object_id relation
     mergedParams.put(RodaConstants.PLUGIN_PARAMS_OUTCOMEOBJECTID_TO_SOURCEOBJECTID_MAP,
-      JsonUtils.getJsonFromObject(pack.getJobPluginInfo().getAipIdToTransferredResourceIds()));
+      JsonUtils.getJsonFromObject(bundle.getJobPluginInfo().getAipIdToTransferredResourceIds()));
 
     try {
       plugin.setParameterValues(mergedParams);
-      List<LiteOptionalWithCause> lites = LiteRODAObjectFactory.transformIntoLiteWithCause(pack.getModel(),
-        pack.getAips());
-      return plugin.execute(pack.getIndex(), pack.getModel(), pack.getStorage(), lites);
+      List<LiteOptionalWithCause> lites = LiteRODAObjectFactory.transformIntoLiteWithCause(bundle.getModel(),
+        bundle.getAips());
+      return plugin.execute(bundle.getIndex(), bundle.getModel(), bundle.getStorage(), lites);
     } catch (InvalidParameterException | PluginException | RuntimeException e) {
       LOGGER.error("Error executing plugin: {}", pluginName, e);
     }
@@ -83,13 +83,13 @@ public class IngestStepsUtils {
    * Recalculates (if failures must be noticed) and updates AIP objects (by
    * obtaining them from model)
    */
-  public static void recalculateAIPsList(IngestExecutePack pack, boolean removeAIPProcessingFailed) {
-    pack.getAips().clear();
+  public static void recalculateAIPsList(IngestStepBundle bundle, boolean removeAIPProcessingFailed) {
+    bundle.getAips().clear();
     Set<String> aipsToReturn = new HashSet<>();
     Set<String> transferredResourceAips;
     List<String> transferredResourcesToRemoveFromjobPluginInfo = new ArrayList<>();
     boolean oneTransferredResourceAipFailed;
-    IngestJobPluginInfo jobPluginInfo = pack.getJobPluginInfo();
+    IngestJobPluginInfo jobPluginInfo = bundle.getJobPluginInfo();
 
     for (Map.Entry<String, Map<String, Report>> transferredResourcejobPluginInfoEntry : jobPluginInfo
       .getReportsFromBeingProcessed().entrySet()) {
@@ -114,7 +114,7 @@ public class IngestStepsUtils {
             "Will not process AIPs from transferred resource '{}' any longer because at least one of them failed",
             transferredResourceId);
           jobPluginInfo.incrementObjectsProcessedWithFailure();
-          jobPluginInfo.failOtherTransferredResourceAIPs(pack.getModel(), pack.getIndex(), transferredResourceId);
+          jobPluginInfo.failOtherTransferredResourceAIPs(bundle.getModel(), bundle.getIndex(), transferredResourceId);
           transferredResourcesToRemoveFromjobPluginInfo.add(transferredResourceId);
         } else {
           aipsToReturn.addAll(transferredResourceAips);
@@ -130,28 +130,28 @@ public class IngestStepsUtils {
 
     for (String aipId : aipsToReturn) {
       try {
-        pack.getAips().add(pack.getModel().retrieveAIP(aipId));
+        bundle.getAips().add(bundle.getModel().retrieveAIP(aipId));
       } catch (RequestNotValidException | NotFoundException | GenericException | AuthorizationDeniedException e) {
         LOGGER.error("Error while retrieving AIP", e);
       }
     }
   }
 
-  public static void updateAIPsToBeAppraised(IngestExecutePack pack, Job cachedJob) {
-    for (AIP aip : pack.getAips()) {
+  public static void updateAIPsToBeAppraised(IngestStepBundle bundle, Job cachedJob) {
+    for (AIP aip : bundle.getAips()) {
       aip.setState(AIPState.UNDER_APPRAISAL);
       try {
-        aip = pack.getModel().updateAIPState(aip, cachedJob.getUsername());
+        aip = bundle.getModel().updateAIPState(aip, cachedJob.getUsername());
 
-        pack.getParameterValues().put(RodaConstants.PLUGIN_PARAMS_OUTCOMEOBJECTID_TO_SOURCEOBJECTID_MAP,
-          JsonUtils.getJsonFromObject(pack.getJobPluginInfo().getAipIdToTransferredResourceIds()));
+        bundle.getParameterValues().put(RodaConstants.PLUGIN_PARAMS_OUTCOMEOBJECTID_TO_SOURCEOBJECTID_MAP,
+          JsonUtils.getJsonFromObject(bundle.getJobPluginInfo().getAipIdToTransferredResourceIds()));
 
         // update main report outcomeObjectState
-        PluginHelper.updateJobReportState(pack.getIngestPlugin(), pack.getModel(), aip.getIngestSIPUUID(), aip.getId(),
+        PluginHelper.updateJobReportState(bundle.getIngestPlugin(), bundle.getModel(), aip.getIngestSIPUUID(), aip.getId(),
           AIPState.UNDER_APPRAISAL, cachedJob);
 
         // update counters of manual intervention
-        pack.getJobPluginInfo().incrementOutcomeObjectsWithManualIntervention();
+        bundle.getJobPluginInfo().incrementOutcomeObjectsWithManualIntervention();
       } catch (GenericException | NotFoundException | RequestNotValidException | AuthorizationDeniedException e) {
         LOGGER.error("Error while updating AIP state to '{}'. Reason: {}", AIPState.UNDER_APPRAISAL, e.getMessage());
       }

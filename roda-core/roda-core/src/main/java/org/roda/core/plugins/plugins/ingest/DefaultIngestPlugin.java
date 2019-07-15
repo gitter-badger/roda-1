@@ -7,17 +7,25 @@
  */
 package org.roda.core.plugins.plugins.ingest;
 
+import java.io.IOException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
+import java.util.Set;
 
 import org.apache.commons.lang3.StringUtils;
 import org.roda.core.RodaCoreFactory;
+import org.roda.core.common.notifications.EmailNotificationProcessor;
+import org.roda.core.common.notifications.HTTPNotificationProcessor;
 import org.roda.core.data.common.RodaConstants;
 import org.roda.core.data.common.RodaConstants.PreservationEventType;
 import org.roda.core.data.exceptions.AlreadyExistsException;
@@ -27,9 +35,14 @@ import org.roda.core.data.exceptions.InvalidParameterException;
 import org.roda.core.data.exceptions.JobException;
 import org.roda.core.data.exceptions.NotFoundException;
 import org.roda.core.data.exceptions.RequestNotValidException;
+import org.roda.core.data.utils.JsonUtils;
 import org.roda.core.data.v2.LiteOptionalWithCause;
+import org.roda.core.data.v2.index.filter.Filter;
+import org.roda.core.data.v2.index.filter.SimpleFilterParameter;
 import org.roda.core.data.v2.ip.AIP;
+import org.roda.core.data.v2.ip.AIPState;
 import org.roda.core.data.v2.ip.TransferredResource;
+import org.roda.core.data.v2.jobs.IndexedReport;
 import org.roda.core.data.v2.jobs.Job;
 import org.roda.core.data.v2.jobs.JobStats;
 import org.roda.core.data.v2.jobs.PluginParameter;
@@ -37,8 +50,10 @@ import org.roda.core.data.v2.jobs.PluginParameter.PluginParameterType;
 import org.roda.core.data.v2.jobs.PluginType;
 import org.roda.core.data.v2.jobs.Report;
 import org.roda.core.data.v2.jobs.Report.PluginState;
+import org.roda.core.data.v2.notifications.Notification;
 import org.roda.core.data.v2.validation.ValidationException;
 import org.roda.core.index.IndexService;
+import org.roda.core.index.utils.IterableIndexResult;
 import org.roda.core.model.LiteRODAObjectFactory;
 import org.roda.core.model.ModelService;
 import org.roda.core.plugins.AbstractPlugin;
@@ -48,13 +63,16 @@ import org.roda.core.plugins.RODAObjectsProcessingLogic;
 import org.roda.core.plugins.orchestrate.IngestJobPluginInfo;
 import org.roda.core.plugins.orchestrate.JobPluginInfo;
 import org.roda.core.plugins.plugins.PluginHelper;
-import org.roda.core.plugins.plugins.ingest.notifications.IngestNotification;
-import org.roda.core.plugins.plugins.ingest.steps.IngestExecutePack;
-import org.roda.core.plugins.plugins.ingest.steps.IngestStep;
-import org.roda.core.plugins.plugins.ingest.steps.IngestStepsUtils;
+import org.roda.core.plugins.plugins.antivirus.AntivirusPlugin;
+import org.roda.core.plugins.plugins.base.DescriptiveMetadataValidationPlugin;
+import org.roda.core.plugins.plugins.characterization.PremisSkeletonPlugin;
+import org.roda.core.plugins.plugins.characterization.SiegfriedPlugin;
 import org.roda.core.storage.StorageService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.github.jknack.handlebars.Handlebars;
+import com.google.common.base.CaseFormat;
 
 /***
  * https://docs.google.com/spreadsheets/d/
@@ -82,7 +100,8 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
   public static final String PLUGIN_CLASS_TIKA_FULLTEXT = "org.roda.core.plugins.external.TikaFullTextPlugin";
 
   public static final String PLUGIN_PARAMS_DO_VERAPDF_CHECK = "parameter.do_verapdf_check";
-  public static final String PLUGIN_PARAMS_DO_FEATURE_AND_FULL_TEXT_EXTRACTION = "parameter.do_feature_full_text_extraction";
+  public static final String PLUGIN_PARAMS_DO_FEATURE_EXTRACTION = "parameter.do_feature_extraction";
+  public static final String PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION = "parameter.do_fulltext_extraction";
   public static final String PLUGIN_PARAMS_DO_DIGITAL_SIGNATURE_VALIDATION = "parameter.do_digital_signature_validation";
 
   private String successMessage;
@@ -155,7 +174,7 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
       // 1) unpacking & wellformedness check (transform TransferredResource into
       // an AIP)
       pluginReport = transformTransferredResourceIntoAnAIP(index, model, storage, resources);
-      IngestStepsUtils.mergeReports(jobPluginInfo, pluginReport);
+      mergeReports(jobPluginInfo, pluginReport);
       final List<AIP> aips = getAIPsFromReports(model, index, jobPluginInfo);
       PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
 
@@ -163,12 +182,107 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
       // performed here, after transformTransferredResourceIntoAnAIP
       createIngestStartedEvent(model, index, jobPluginInfo, startDate, cachedJob);
 
-      List<IngestStep> steps = getIngestSteps();
+      // 2) virus check
+      if (!aips.isEmpty() && PluginHelper.verifyIfStepShouldBePerformed(this,
+        getPluginParameter(RodaConstants.PLUGIN_PARAMS_DO_VIRUS_CHECK))) {
+        pluginReport = doVirusCheck(index, model, storage, aips, jobPluginInfo);
+        mergeReports(jobPluginInfo, pluginReport);
+        recalculateAIPsList(model, index, jobPluginInfo, aips, true);
+        PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
+      }
 
-      for (IngestStep step : steps) {
-        IngestExecutePack pack = new IngestExecutePack(this, index, model, storage, jobPluginInfo,
-          getPluginParameter(step.getParameterName()), getParameterValues(), resources, aips);
-        step.execute(pack);
+      // 3) descriptive metadata validation
+      if (!aips.isEmpty() && PluginHelper.verifyIfStepShouldBePerformed(this,
+        getPluginParameter(RodaConstants.PLUGIN_PARAMS_DO_DESCRIPTIVE_METADATA_VALIDATION))) {
+        pluginReport = doDescriptiveMetadataValidation(index, model, storage, aips, jobPluginInfo);
+        mergeReports(jobPluginInfo, pluginReport);
+        recalculateAIPsList(model, index, jobPluginInfo, aips, true);
+        PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
+      }
+
+      // 4) create file fixity information
+      if (!aips.isEmpty() && PluginHelper.verifyIfStepShouldBePerformed(this,
+        getPluginParameter(RodaConstants.PLUGIN_PARAMS_CREATE_PREMIS_SKELETON))) {
+        pluginReport = createFileFixityInformation(index, model, storage, aips, jobPluginInfo);
+        mergeReports(jobPluginInfo, pluginReport);
+        recalculateAIPsList(model, index, jobPluginInfo, aips, true);
+        PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
+      }
+
+      // 5) format identification (using Siegfried)
+      if (!aips.isEmpty() && PluginHelper.verifyIfStepShouldBePerformed(this,
+        getPluginParameter(RodaConstants.PLUGIN_PARAMS_DO_FILE_FORMAT_IDENTIFICATION))) {
+        pluginReport = doFileFormatIdentification(index, model, storage, aips, jobPluginInfo);
+        mergeReports(jobPluginInfo, pluginReport);
+        recalculateAIPsList(model, index, jobPluginInfo, aips, false);
+        PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
+      }
+
+      // 6) Format validation - PDF/A format validator (using VeraPDF)
+      if (!aips.isEmpty() && PluginHelper.verifyIfStepShouldBePerformed(this,
+        getPluginParameter(PLUGIN_PARAMS_DO_VERAPDF_CHECK), PLUGIN_CLASS_VERAPDF)) {
+        Map<String, String> params = new HashMap<>();
+        params.put("profile", "1b");
+        pluginReport = doVeraPDFCheck(index, model, storage, aips, params, jobPluginInfo);
+        mergeReports(jobPluginInfo, pluginReport);
+        recalculateAIPsList(model, index, jobPluginInfo, aips, false);
+        PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
+      }
+
+      // 7.1) feature extraction (using Apache Tika)
+      // 7.2) full-text extraction (using Apache Tika)
+      if (!aips.isEmpty() && (PluginHelper.verifyIfStepShouldBePerformed(this,
+        getPluginParameter(PLUGIN_PARAMS_DO_FEATURE_EXTRACTION), PLUGIN_CLASS_TIKA_FULLTEXT)
+        || PluginHelper.verifyIfStepShouldBePerformed(this, getPluginParameter(PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION),
+          PLUGIN_CLASS_TIKA_FULLTEXT))) {
+        Map<String, String> params = new HashMap<>();
+        params.put(PLUGIN_PARAMS_DO_FEATURE_EXTRACTION, PluginHelper.verifyIfStepShouldBePerformed(this,
+          getPluginParameter(PLUGIN_PARAMS_DO_FEATURE_EXTRACTION), PLUGIN_CLASS_TIKA_FULLTEXT) ? "true" : "false");
+        params.put(RodaConstants.PLUGIN_PARAMS_DO_FULLTEXT_EXTRACTION, PluginHelper.verifyIfStepShouldBePerformed(this,
+          getPluginParameter(PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION), PLUGIN_CLASS_TIKA_FULLTEXT) ? "true" : "false");
+        pluginReport = doFeatureAndFullTextExtraction(index, model, storage, aips, params, jobPluginInfo);
+        mergeReports(jobPluginInfo, pluginReport);
+        recalculateAIPsList(model, index, jobPluginInfo, aips, false);
+        PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
+      }
+
+      // 8) validation of digital signature
+      if (!aips.isEmpty() && PluginHelper.verifyIfStepShouldBePerformed(this,
+        getPluginParameter(PLUGIN_PARAMS_DO_DIGITAL_SIGNATURE_VALIDATION), PLUGIN_CLASS_DIGITAL_SIGNATURE)) {
+        pluginReport = doDigitalSignatureValidation(index, model, storage, aips, jobPluginInfo);
+        mergeReports(jobPluginInfo, pluginReport);
+        recalculateAIPsList(model, index, jobPluginInfo, aips, false);
+        PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
+      }
+
+      // 9) verify producer authorization
+      if (!aips.isEmpty() && PluginHelper.verifyIfStepShouldBePerformed(this,
+        getPluginParameter(RodaConstants.PLUGIN_PARAMS_DO_PRODUCER_AUTHORIZATION_CHECK))) {
+        pluginReport = verifyProducerAuthorization(index, model, storage, aips, jobPluginInfo);
+        mergeReports(jobPluginInfo, pluginReport);
+        recalculateAIPsList(model, index, jobPluginInfo, aips, true);
+        PluginHelper.updateJobInformationAsync(this, jobPluginInfo.incrementStepsCompletedByOne());
+      }
+
+      // 10) Auto accept
+      if (!aips.isEmpty()) {
+        if (PluginHelper.verifyIfStepShouldBePerformed(this,
+          getPluginParameter(RodaConstants.PLUGIN_PARAMS_DO_AUTO_ACCEPT))) {
+          pluginReport = doAutoAccept(index, model, storage, aips, jobPluginInfo);
+          mergeReports(jobPluginInfo, pluginReport);
+          recalculateAIPsList(model, index, jobPluginInfo, aips, true);
+          jobPluginInfo.incrementStepsCompletedByOne();
+        } else {
+          updateAIPsToBeAppraised(model, aips, jobPluginInfo, cachedJob);
+        }
+      }
+
+      // X) move SIPs to PROCESSED folder??? (default: false)
+      if (PluginHelper.verifyIfStepShouldBePerformed(this,
+        getPluginParameter(RodaConstants.PLUGIN_PARAMS_DO_AUTO_ACCEPT))
+        && RodaCoreFactory.getRodaConfiguration()
+          .getBoolean(RodaConstants.CORE_TRANSFERRED_RESOURCES_INGEST_MOVE_WHEN_AUTOACCEPT, false)) {
+        PluginHelper.moveSIPs(this, model, index, resources, jobPluginInfo);
       }
 
       createIngestEndedEvent(model, index, jobPluginInfo, cachedJob);
@@ -179,7 +293,7 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
       jobPluginInfo.finalizeInfo();
       PluginHelper.updateJobInformationAsync(this, jobPluginInfo);
     } catch (JobException e) {
-      // do nothing
+      // throw new PluginException("A job exception has occurred", e);
     } finally {
       // remove locks if any
       PluginHelper.releaseObjectLock(this);
@@ -199,10 +313,7 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
       if (whenFailed && jobStats.getSourceObjectsProcessedWithFailure() == 0) {
         // do nothing
       } else {
-        List<IngestNotification> notifications = getNotifications();
-        for (IngestNotification notification : notifications) {
-          notification.notificate(model, index, job, jobStats);
-        }
+        sendNotification(model, index, job, jobStats);
       }
     } catch (GenericException | RequestNotValidException | NotFoundException | AuthorizationDeniedException e) {
       LOGGER.error("Could not send ingest notification", e);
@@ -241,6 +352,20 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
     return report;
   }
 
+  private void mergeReports(IngestJobPluginInfo jobPluginInfo, Report pluginReport) {
+    if (pluginReport != null) {
+      for (Report reportItem : pluginReport.getReports()) {
+        if (TransferredResource.class.getName().equals(reportItem.getSourceObjectClass())) {
+          Report report = new Report(reportItem);
+          report.addReport(reportItem);
+          jobPluginInfo.addReport(report, false);
+        } else {
+          jobPluginInfo.addReport(reportItem, true);
+        }
+      }
+    }
+  }
+
   private List<AIP> getAIPsFromReports(ModelService model, IndexService index, IngestJobPluginInfo jobPluginInfo) {
     processReports(model, index, jobPluginInfo);
 
@@ -276,6 +401,7 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
           jobPluginInfo.incrementObjectsProcessedWithFailure();
           jobPluginInfo.failOtherTransferredResourceAIPs(model, index, transferredResourceId);
           transferredResourcesToRemoveFromjobPluginInfo.add(transferredResourceId);
+
           break;
         }
       }
@@ -286,13 +412,158 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
     }
   }
 
+  private void sendNotification(ModelService model, IndexService index, Job job, JobStats jobStats)
+    throws GenericException, RequestNotValidException, NotFoundException, AuthorizationDeniedException {
+    String emails = PluginHelper.getStringFromParameters(this,
+      getPluginParameter(RodaConstants.PLUGIN_PARAMS_EMAIL_NOTIFICATION));
+
+    if (StringUtils.isNotBlank(emails)) {
+      List<String> emailList = new ArrayList<>(Arrays.asList(emails.split("\\s*,\\s*")));
+      Notification notification = new Notification();
+      String outcome = PluginState.SUCCESS.toString();
+
+      if (jobStats.getSourceObjectsProcessedWithFailure() > 0) {
+        outcome = PluginState.FAILURE.toString();
+      }
+
+      String subject = RodaCoreFactory.getRodaConfigurationAsString("core", "notification", "ingest_subject");
+      if (StringUtils.isNotBlank(subject)) {
+        subject = subject.replaceAll("\\{RESULT\\}", outcome);
+      } else {
+        subject = outcome;
+      }
+
+      notification.setSubject(subject);
+      notification.setFromUser(this.getClass().getSimpleName());
+      notification.setRecipientUsers(emailList);
+
+      Map<String, Object> scopes = new HashMap<>();
+      scopes.put("outcome", outcome);
+      scopes.put("type", CaseFormat.UPPER_UNDERSCORE.to(CaseFormat.UPPER_CAMEL, job.getPluginType().toString()));
+      scopes.put("sips", jobStats.getSourceObjectsCount());
+      scopes.put("success", jobStats.getSourceObjectsProcessedWithSuccess());
+      scopes.put("failed", jobStats.getSourceObjectsProcessedWithFailure());
+      scopes.put("name", job.getName());
+      scopes.put("creator", job.getUsername());
+
+      if (outcome.equals(PluginState.FAILURE.toString())) {
+        Filter filter = new Filter();
+        filter.add(new SimpleFilterParameter(RodaConstants.JOB_REPORT_JOB_ID, job.getId()));
+        filter.add(new SimpleFilterParameter(RodaConstants.JOB_REPORT_PLUGIN_STATE, PluginState.FAILURE.toString()));
+        try (IterableIndexResult<IndexedReport> reports = index.findAll(IndexedReport.class, filter,
+          Collections.emptyList())) {
+
+          StringBuilder builder = new StringBuilder();
+
+          for (IndexedReport report : reports) {
+            Report last = report.getReports().get(report.getReports().size() - 1);
+            builder.append(last.getPluginDetails()).append("\n\n");
+          }
+
+          scopes.put("failures", new Handlebars.SafeString(builder.toString()));
+        } catch (IOException e) {
+          LOGGER.error("Error getting failed reports", e);
+        }
+      }
+
+      SimpleDateFormat parser = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+      scopes.put("start", parser.format(job.getStartDate()));
+
+      long duration = (new Date().getTime() - job.getStartDate().getTime()) / 1000;
+      scopes.put("duration", duration + " seconds");
+      model.createNotification(notification,
+        new EmailNotificationProcessor(RodaConstants.INGEST_EMAIL_TEMPLATE, scopes));
+    }
+
+    String httpNotifications = PluginHelper.getStringFromParameters(this,
+      getPluginParameter(RodaConstants.NOTIFICATION_HTTP_ENDPOINT));
+
+    if (StringUtils.isNotBlank(httpNotifications)) {
+      Notification notification = new Notification();
+      String outcome = PluginState.SUCCESS.toString();
+
+      if (jobStats.getSourceObjectsProcessedWithFailure() > 0) {
+        outcome = PluginState.FAILURE.toString();
+      }
+
+      notification.setSubject("RODA ingest process finished - " + outcome);
+      notification.setFromUser(this.getClass().getSimpleName());
+      notification.setRecipientUsers(Collections.singletonList(httpNotifications));
+      Map<String, Object> scope = new HashMap<>();
+      scope.put(HTTPNotificationProcessor.JOB_KEY, job);
+      model.createNotification(notification, new HTTPNotificationProcessor(httpNotifications, scope));
+    }
+  }
+
+  /**
+   * Recalculates (if failures must be noticed) and updates AIP objects (by
+   * obtaining them from model)
+   */
+  private void recalculateAIPsList(ModelService model, IndexService index, IngestJobPluginInfo jobPluginInfo,
+    List<AIP> aips, boolean removeAIPProcessingFailed) {
+    aips.clear();
+    Set<String> aipsToReturn = new HashSet<>();
+    Set<String> transferredResourceAips;
+    List<String> transferredResourcesToRemoveFromjobPluginInfo = new ArrayList<>();
+    boolean oneTransferredResourceAipFailed;
+
+    for (Entry<String, Map<String, Report>> transferredResourcejobPluginInfoEntry : jobPluginInfo
+      .getReportsFromBeingProcessed().entrySet()) {
+      String transferredResourceId = transferredResourcejobPluginInfoEntry.getKey();
+      transferredResourceAips = new HashSet<>();
+      oneTransferredResourceAipFailed = false;
+
+      if (jobPluginInfo.getAipIds(transferredResourceId) != null) {
+        for (String aipId : jobPluginInfo.getAipIds(transferredResourceId)) {
+          Report aipReport = transferredResourcejobPluginInfoEntry.getValue().get(aipId);
+          if (aipReport.getPluginState() == PluginState.FAILURE) {
+            LOGGER.trace("Removing AIP {} from the list", aipReport.getOutcomeObjectId());
+            oneTransferredResourceAipFailed = true;
+            break;
+          } else {
+            transferredResourceAips.add(aipId);
+          }
+        }
+
+        if (oneTransferredResourceAipFailed) {
+          LOGGER.info(
+            "Will not process AIPs from transferred resource '{}' any longer because at least one of them failed",
+            transferredResourceId);
+          jobPluginInfo.incrementObjectsProcessedWithFailure();
+          jobPluginInfo.failOtherTransferredResourceAIPs(model, index, transferredResourceId);
+          transferredResourcesToRemoveFromjobPluginInfo.add(transferredResourceId);
+        } else {
+          aipsToReturn.addAll(transferredResourceAips);
+        }
+      }
+    }
+
+    if (removeAIPProcessingFailed) {
+      for (String transferredResourceId : transferredResourcesToRemoveFromjobPluginInfo) {
+        jobPluginInfo.remove(transferredResourceId);
+      }
+    }
+
+    for (String aipId : aipsToReturn) {
+      try {
+        aips.add(model.retrieveAIP(aipId));
+      } catch (RequestNotValidException | NotFoundException | GenericException | AuthorizationDeniedException e) {
+        LOGGER.error("Error while retrieving AIP", e);
+      }
+    }
+  }
+
   private int calculateEffectiveTotalSteps() {
     // 20180716 hsilva: the following list contains ids of the parameters that
-    // are not steps & therefore must be ignored when calculating the amount of
+    // are not steps & therefore must be ignored when calculation the amount of
     // effective steps
     List<String> parameterIdsToIgnore = Arrays.asList(RodaConstants.PLUGIN_PARAMS_FORCE_PARENT_ID,
+      PLUGIN_PARAMS_DO_FEATURE_EXTRACTION, PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION,
       RodaConstants.PLUGIN_PARAMS_NOTIFICATION_WHEN_FAILED);
     int effectiveTotalSteps = getTotalSteps();
+    boolean tikaParameters = false;
+    boolean dontDoFeatureExtraction = false;
+    boolean dontDoFulltext = false;
 
     for (PluginParameter pluginParameter : getParameters()) {
       if (pluginParameter.getType() == PluginParameterType.BOOLEAN
@@ -300,8 +571,24 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
         && !PluginHelper.verifyIfStepShouldBePerformed(this, pluginParameter)) {
         effectiveTotalSteps--;
       }
+
+      if (pluginParameter.getId().equals(PLUGIN_PARAMS_DO_FEATURE_EXTRACTION)) {
+        tikaParameters = true;
+        if (!PluginHelper.verifyIfStepShouldBePerformed(this, pluginParameter)) {
+          dontDoFeatureExtraction = true;
+        }
+      }
+      if (pluginParameter.getId().equals(PLUGIN_PARAMS_DO_FULL_TEXT_EXTRACTION)) {
+        tikaParameters = true;
+        if (!PluginHelper.verifyIfStepShouldBePerformed(this, pluginParameter)) {
+          dontDoFulltext = true;
+        }
+      }
     }
 
+    if (tikaParameters && (dontDoFeatureExtraction && dontDoFulltext)) {
+      effectiveTotalSteps--;
+    }
     return effectiveTotalSteps;
   }
 
@@ -339,6 +626,103 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
     setPreservationFailureMessage(END_FAILURE);
     setPreservationEventDescription(END_DESCRIPTION);
     createIngestEvent(model, index, jobPluginInfo, new Date(), cachedJob);
+  }
+
+  private Report createFileFixityInformation(IndexService index, ModelService model, StorageService storage,
+    List<AIP> aips, IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, PremisSkeletonPlugin.class.getName(), jobPluginInfo);
+  }
+
+  private Report doVirusCheck(IndexService index, ModelService model, StorageService storage, List<AIP> aips,
+    IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, AntivirusPlugin.class.getName(), jobPluginInfo);
+  }
+
+  private Report doVeraPDFCheck(IndexService index, ModelService model, StorageService storage, List<AIP> aips,
+    Map<String, String> params, IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, PLUGIN_CLASS_VERAPDF, params, jobPluginInfo);
+  }
+
+  private Report doDescriptiveMetadataValidation(IndexService index, ModelService model, StorageService storage,
+    List<AIP> aips, IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, DescriptiveMetadataValidationPlugin.class.getName(),
+      jobPluginInfo);
+  }
+
+  private Report verifyProducerAuthorization(IndexService index, ModelService model, StorageService storage,
+    List<AIP> aips, IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, VerifyUserAuthorizationPlugin.class.getName(), jobPluginInfo);
+  }
+
+  private Report doFileFormatIdentification(IndexService index, ModelService model, StorageService storage,
+    List<AIP> aips, IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, SiegfriedPlugin.class.getName(), jobPluginInfo);
+  }
+
+  private Report doDigitalSignatureValidation(IndexService index, ModelService model, StorageService storage,
+    List<AIP> aips, IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, PLUGIN_CLASS_DIGITAL_SIGNATURE, jobPluginInfo);
+  }
+
+  private Report doFeatureAndFullTextExtraction(IndexService index, ModelService model, StorageService storage,
+    List<AIP> aips, Map<String, String> params, IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, PLUGIN_CLASS_TIKA_FULLTEXT, params, jobPluginInfo);
+  }
+
+  private Report doAutoAccept(IndexService index, ModelService model, StorageService storage, List<AIP> aips,
+    IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, AutoAcceptSIPPlugin.class.getName(), jobPluginInfo);
+  }
+
+  private Report executePlugin(IndexService index, ModelService model, StorageService storage, List<AIP> aips,
+    String pluginClassName, IngestJobPluginInfo jobPluginInfo) {
+    return executePlugin(index, model, storage, aips, pluginClassName, null, jobPluginInfo);
+  }
+
+  private Report executePlugin(IndexService index, ModelService model, StorageService storage, List<AIP> aips,
+    String pluginClassName, Map<String, String> params, IngestJobPluginInfo jobPluginInfo) {
+    Plugin<AIP> plugin = RodaCoreFactory.getPluginManager().getPlugin(pluginClassName, AIP.class);
+    Map<String, String> mergedParams = new HashMap<>(getParameterValues());
+    if (params != null) {
+      mergedParams.putAll(params);
+    }
+
+    // set outcome_object_id > source_object_id relation
+    mergedParams.put(RodaConstants.PLUGIN_PARAMS_OUTCOMEOBJECTID_TO_SOURCEOBJECTID_MAP,
+      JsonUtils.getJsonFromObject(jobPluginInfo.getAipIdToTransferredResourceIds()));
+
+    try {
+      plugin.setParameterValues(mergedParams);
+      List<LiteOptionalWithCause> lites = LiteRODAObjectFactory.transformIntoLiteWithCause(model, aips);
+      return plugin.execute(index, model, storage, lites);
+    } catch (InvalidParameterException | PluginException | RuntimeException e) {
+      LOGGER.error("Error executing plugin", e);
+    }
+
+    return null;
+  }
+
+  private void updateAIPsToBeAppraised(ModelService model, List<AIP> aips, IngestJobPluginInfo jobPluginInfo,
+    Job cachedJob) {
+    for (AIP aip : aips) {
+      aip.setState(AIPState.UNDER_APPRAISAL);
+      try {
+        aip = model.updateAIPState(aip, cachedJob.getUsername());
+
+        getParameterValues().put(RodaConstants.PLUGIN_PARAMS_OUTCOMEOBJECTID_TO_SOURCEOBJECTID_MAP,
+          JsonUtils.getJsonFromObject(jobPluginInfo.getAipIdToTransferredResourceIds()));
+
+        // update main report outcomeObjectState
+        PluginHelper.updateJobReportState(this, model, aip.getIngestSIPUUID(), aip.getId(), AIPState.UNDER_APPRAISAL,
+          cachedJob);
+
+        // update counters of manual intervention
+        jobPluginInfo.incrementOutcomeObjectsWithManualIntervention();
+
+      } catch (GenericException | NotFoundException | RequestNotValidException | AuthorizationDeniedException e) {
+        LOGGER.error("Error while updating AIP state to '{}'. Reason: {}", AIPState.UNDER_APPRAISAL, e.getMessage());
+      }
+    }
   }
 
   @Override
@@ -406,10 +790,6 @@ public abstract class DefaultIngestPlugin extends AbstractPlugin<TransferredReso
   }
 
   public abstract void setTotalSteps();
-
-  public abstract List<IngestStep> getIngestSteps();
-
-  public abstract List<IngestNotification> getNotifications();
 
   public abstract Optional<? extends AfterExecute> getAfterExecute();
 

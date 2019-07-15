@@ -1315,6 +1315,7 @@ public final class RodaConstants {
 
   /* Template Constants */
   public static final String INGEST_EMAIL_TEMPLATE = "ingestion-template.vm";
+  public static final String GENERIC_EMAIL_TEMPLATE = "generic-template.vm";
   public static final String VERIFICATION_EMAIL_TEMPLATE = "emailverification_html.vm";
   public static final String VERIFICATION_EMAIL_TEMPLATE_SUBJECT_TRANSLATION = "email.verification.subject";
   public static final String VERIFICATION_EMAIL_TEMPLATE_FROM_TRANSLATION = "email.verification.from";
